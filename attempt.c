@@ -6,11 +6,18 @@
 #include <stdbool.h>
 #include <string.h>
 
-#define WINDOW_WIDTH 640
-#define WINDOW_HEIGHT 480
+// Original grid dimensions
 #define CELL_SIZE 20
-#define GRID_WIDTH (WINDOW_WIDTH / CELL_SIZE)
-#define GRID_HEIGHT (WINDOW_HEIGHT / CELL_SIZE)
+#define GRID_WIDTH 32  // 640 / 20
+#define GRID_HEIGHT 24 // 480 / 20
+
+// UI dimensions
+#define UI_HEIGHT 60  // Height of the UI area above the grid
+#define UI_PADDING 10 // Padding inside UI area
+
+// New window dimensions
+#define WINDOW_WIDTH (GRID_WIDTH * CELL_SIZE)
+#define WINDOW_HEIGHT (GRID_HEIGHT * CELL_SIZE + UI_HEIGHT)
 
 // Score display constants
 #define SCORE_DIGIT_WIDTH 10
@@ -22,6 +29,9 @@
 #define BUTTON_WIDTH 200
 #define BUTTON_HEIGHT 50
 #define BUTTON_PADDING 20
+
+// Highscore file name
+#define HIGHSCORE_FILE "highscore.dat"
 
 // Game states
 typedef enum {
@@ -57,7 +67,7 @@ void draw_snake(SDL_Renderer *renderer, Snake *snake);
 void draw_food(SDL_Renderer *renderer, Food *food);
 void draw_segment(SDL_Renderer *renderer, int x, int y, char segment, int width, int height, int thickness);
 void draw_digit(SDL_Renderer *renderer, int x, int y, int digit, int width, int height, int thickness);
-void draw_score(SDL_Renderer *renderer, int score, TTF_Font *font);
+void draw_score(SDL_Renderer *renderer, int score, int highscore, TTF_Font *font);
 void move_snake(Snake *snake);
 bool check_food_collision(Snake *snake, Food *food);
 void place_food(Food *food, Snake *snake);
@@ -67,41 +77,65 @@ void draw_button(SDL_Renderer *renderer, Button *button, TTF_Font *font);
 bool is_point_in_rect(int x, int y, SDL_Rect *rect);
 void draw_text(SDL_Renderer *renderer, TTF_Font *font, const char *text, int x, int y, SDL_Color color);
 void draw_text_centered(SDL_Renderer *renderer, TTF_Font *font, const char *text, int x, int y, SDL_Color color);
-void draw_welcome_screen(SDL_Renderer *renderer, Button *playButton, TTF_Font *font);
-void draw_game_over_screen(SDL_Renderer *renderer, int score, Button *playAgainButton, Button *exitButton, TTF_Font *font);
+void draw_welcome_screen(SDL_Renderer *renderer, Button *playButton, TTF_Font *font, int highscore);
+void draw_game_over_screen(SDL_Renderer *renderer, int score, int highscore, Button *playAgainButton, Button *exitButton, TTF_Font *font);
 void reset_game(Snake *snake, Food *food, int *score);
+void draw_ui_area(SDL_Renderer *renderer, int score, int highscore, TTF_Font *font);
+int load_highscore(void);
+void save_highscore(int score);
 
 // Main function remains at the bottom
 
 void draw_grid(SDL_Renderer *renderer) {
     SDL_SetRenderDrawColor(renderer, 50, 50, 50, 255);
 
+    // Draw grid inside the game area only
     for (int x = 0; x <= WINDOW_WIDTH; x += CELL_SIZE) {
-        SDL_RenderDrawLine(renderer, x, 0, x, WINDOW_HEIGHT);
+        SDL_RenderDrawLine(renderer, x, UI_HEIGHT, x, WINDOW_HEIGHT);
     }
 
-    for (int y = 0; y <= WINDOW_HEIGHT; y += CELL_SIZE) {
+    for (int y = UI_HEIGHT; y <= WINDOW_HEIGHT; y += CELL_SIZE) {
         SDL_RenderDrawLine(renderer, 0, y, WINDOW_WIDTH, y);
     }
+    
+    // Draw a more prominent border around the grid
+    SDL_SetRenderDrawColor(renderer, 100, 100, 100, 255);
+    SDL_Rect border = {0, UI_HEIGHT, WINDOW_WIDTH, WINDOW_HEIGHT - UI_HEIGHT};
+    SDL_RenderDrawRect(renderer, &border);
 }
 
 void draw_snake(SDL_Renderer *renderer, Snake *snake) {
     // Draw body segments in green
     SDL_SetRenderDrawColor(renderer, 0, 200, 0, 255);
     for (int i = 1; i < snake->length; i++) {
-        SDL_Rect rect = {snake->body[i].x * CELL_SIZE, snake->body[i].y * CELL_SIZE, CELL_SIZE, CELL_SIZE};
+        SDL_Rect rect = {
+            snake->body[i].x * CELL_SIZE, 
+            snake->body[i].y * CELL_SIZE + UI_HEIGHT, // Adjust for UI area
+            CELL_SIZE, 
+            CELL_SIZE
+        };
         SDL_RenderFillRect(renderer, &rect);
     }
     
     // Draw head in brighter green
     SDL_SetRenderDrawColor(renderer, 0, 255, 0, 255);
-    SDL_Rect head_rect = {snake->body[0].x * CELL_SIZE, snake->body[0].y * CELL_SIZE, CELL_SIZE, CELL_SIZE};
+    SDL_Rect head_rect = {
+        snake->body[0].x * CELL_SIZE, 
+        snake->body[0].y * CELL_SIZE + UI_HEIGHT, // Adjust for UI area
+        CELL_SIZE, 
+        CELL_SIZE
+    };
     SDL_RenderFillRect(renderer, &head_rect);
 }
 
 void draw_food(SDL_Renderer *renderer, Food *food) {
     SDL_SetRenderDrawColor(renderer, 255, 0, 0, 255);
-    SDL_Rect rect = {food->x * CELL_SIZE, food->y * CELL_SIZE, CELL_SIZE, CELL_SIZE};
+    SDL_Rect rect = {
+        food->x * CELL_SIZE, 
+        food->y * CELL_SIZE + UI_HEIGHT, // Adjust for UI area
+        CELL_SIZE, 
+        CELL_SIZE
+    };
     SDL_RenderFillRect(renderer, &rect);
 }
 
@@ -164,19 +198,66 @@ void draw_digit(SDL_Renderer *renderer, int x, int y, int digit, int width, int 
     }
 }
 
-// Function to draw the score in the top-left corner using SDL_ttf
-void draw_score(SDL_Renderer *renderer, int score, TTF_Font *font) {
-    // Background for score display
-    SDL_SetRenderDrawColor(renderer, 30, 30, 30, 255);
-    SDL_Rect score_bg = {SCORE_PADDING, SCORE_PADDING, 150, 40};
-    SDL_RenderFillRect(renderer, &score_bg);
+// Load the highest score from file
+int load_highscore(void) {
+    int highscore = 0;
+    FILE *file = fopen(HIGHSCORE_FILE, "rb");
+    
+    if (file) {
+        fread(&highscore, sizeof(int), 1, file);
+        fclose(file);
+    }
+    
+    return highscore;
+}
+
+// Save the highest score to file
+void save_highscore(int score) {
+    int current_highscore = load_highscore();
+    
+    if (score > current_highscore) {
+        FILE *file = fopen(HIGHSCORE_FILE, "wb");
+        
+        if (file) {
+            fwrite(&score, sizeof(int), 1, file);
+            fclose(file);
+        }
+    }
+}
+
+// Function to draw the UI area with score and high score
+void draw_ui_area(SDL_Renderer *renderer, int score, int highscore, TTF_Font *font) {
+    // Background for UI area
+    SDL_SetRenderDrawColor(renderer, 30, 30, 40, 255);
+    SDL_Rect ui_rect = {0, 0, WINDOW_WIDTH, UI_HEIGHT};
+    SDL_RenderFillRect(renderer, &ui_rect);
+    
+    // Draw a border between UI area and game grid
+    SDL_SetRenderDrawColor(renderer, 100, 100, 100, 255);
+    SDL_RenderDrawLine(renderer, 0, UI_HEIGHT, WINDOW_WIDTH, UI_HEIGHT);
     
     // Draw score text with SDL_ttf
     char score_text[32];
     sprintf(score_text, "SCORE: %d", score);
     
     SDL_Color white = {255, 255, 255, 255};
-    draw_text(renderer, font, score_text, SCORE_PADDING * 2, SCORE_PADDING * 2, white);
+    draw_text(renderer, font, score_text, UI_PADDING, UI_HEIGHT / 2 - 10, white);
+    
+    // Draw high score text with SDL_ttf
+    char highscore_text[32];
+    sprintf(highscore_text, "HIGH SCORE: %d", highscore);
+    
+    // Calculate the position for high score (right-aligned)
+    SDL_Surface *surface = TTF_RenderText_Solid(font, highscore_text, white);
+    int highscore_x = WINDOW_WIDTH - UI_PADDING - surface->w;
+    SDL_FreeSurface(surface);
+    
+    draw_text(renderer, font, highscore_text, highscore_x, UI_HEIGHT / 2 - 10, white);
+}
+
+// Modified score function now also displays high score
+void draw_score(SDL_Renderer *renderer, int score, int highscore, TTF_Font *font) {
+    draw_ui_area(renderer, score, highscore, font);
 }
 
 void move_snake(Snake *snake) {
@@ -298,25 +379,37 @@ void draw_text_centered(SDL_Renderer *renderer, TTF_Font *font, const char *text
     SDL_DestroyTexture(texture);
 }
 
-// Draw welcome screen with SDL_ttf
-void draw_welcome_screen(SDL_Renderer *renderer, Button *playButton, TTF_Font *font) {
+// Draw welcome screen with SDL_ttf, now including high score display
+void draw_welcome_screen(SDL_Renderer *renderer, Button *playButton, TTF_Font *font, int highscore) {
     // Background
     SDL_SetRenderDrawColor(renderer, 20, 20, 40, 255);
     SDL_RenderClear(renderer);
     
     // Title
     SDL_Color green = {0, 200, 0, 255};
-    draw_text_centered(renderer, font, "WELCOME TO SNAKE GAME", 
+    draw_text_centered(renderer, font, "WELCOME TO SNAKE GAME SINGLE PLAYER", 
                      WINDOW_WIDTH / 2, 
-                     WINDOW_HEIGHT / 3, 
+                     WINDOW_HEIGHT / 3 - 20, 
                      green);
+    
+    // High score display
+    if (highscore > 0) {
+        char highscore_text[32];
+        sprintf(highscore_text, "HIGH SCORE: %d", highscore);
+        
+        SDL_Color gold = {255, 215, 0, 255};
+        draw_text_centered(renderer, font, highscore_text, 
+                         WINDOW_WIDTH / 2, 
+                         WINDOW_HEIGHT / 3 + 20, 
+                         gold);
+    }
     
     // Draw play button with SDL_ttf
     draw_button(renderer, playButton, font);
 }
 
-// Draw game over screen with SDL_ttf
-void draw_game_over_screen(SDL_Renderer *renderer, int score, Button *playAgainButton, Button *exitButton, TTF_Font *font) {
+// Draw game over screen with SDL_ttf, now including high score display
+void draw_game_over_screen(SDL_Renderer *renderer, int score, int highscore, Button *playAgainButton, Button *exitButton, TTF_Font *font) {
     // Semi-transparent overlay
     SDL_SetRenderDrawColor(renderer, 0, 0, 0, 200);
     SDL_Rect overlay = {0, 0, WINDOW_WIDTH, WINDOW_HEIGHT};
@@ -326,7 +419,7 @@ void draw_game_over_screen(SDL_Renderer *renderer, int score, Button *playAgainB
     SDL_Color red = {255, 0, 0, 255};
     draw_text_centered(renderer, font, "GAME OVER", 
                      WINDOW_WIDTH / 2, 
-                     WINDOW_HEIGHT / 4, 
+                     WINDOW_HEIGHT / 4 - 20, 
                      red);
     
     // Score text
@@ -335,8 +428,26 @@ void draw_game_over_screen(SDL_Renderer *renderer, int score, Button *playAgainB
     SDL_Color white = {255, 255, 255, 255};
     draw_text_centered(renderer, font, score_text, 
                      WINDOW_WIDTH / 2, 
-                     WINDOW_HEIGHT / 3, 
+                     WINDOW_HEIGHT / 3 - 10, 
                      white);
+    
+    // High score text
+    char highscore_text[32];
+    if (score > highscore) {
+        sprintf(highscore_text, "NEW HIGH SCORE!");
+        SDL_Color gold = {255, 215, 0, 255};
+        draw_text_centered(renderer, font, highscore_text, 
+                         WINDOW_WIDTH / 2, 
+                         WINDOW_HEIGHT / 3 + 20, 
+                         gold);
+    } else if (highscore > 0) {
+        sprintf(highscore_text, "HIGH SCORE: %d", highscore);
+        SDL_Color white = {255, 255, 255, 255};
+        draw_text_centered(renderer, font, highscore_text, 
+                         WINDOW_WIDTH / 2, 
+                         WINDOW_HEIGHT / 3 + 20, 
+                         white);
+    }
     
     // Draw buttons with SDL_ttf
     draw_button(renderer, playAgainButton, font);
@@ -410,6 +521,9 @@ int main() {
 
     // Initialize random number generator
     srand(time(NULL));
+    
+    // Load the highest score
+    int highscore = load_highscore();
     
     // Initialize game state
     GameState gameState = MENU;
@@ -532,13 +646,19 @@ int main() {
                 }
             } else {
                 gameState = GAME_OVER;
+                
+                // Check and update high score
+                if (score > highscore) {
+                    highscore = score;
+                    save_highscore(highscore);
+                }
             }
         }
 
         // Render based on game state
         switch (gameState) {
             case MENU:
-                draw_welcome_screen(renderer, &playButton, font);
+                draw_welcome_screen(renderer, &playButton, font, highscore);
                 break;
                 
             case PLAYING:
@@ -547,15 +667,15 @@ int main() {
                 SDL_RenderClear(renderer);
                 
                 // Draw game elements
+                draw_ui_area(renderer, score, highscore, small_font); // Draw UI area with score and high score
                 draw_grid(renderer);
                 draw_snake(renderer, &snake);
                 draw_food(renderer, &food);
-                draw_score(renderer, score, small_font);
                 break;
                 
             case GAME_OVER:
                 // Keep the game screen visible in the background
-                draw_game_over_screen(renderer, score, &playAgainButton, &exitButton, font);
+                draw_game_over_screen(renderer, score, highscore, &playAgainButton, &exitButton, font);
                 break;
         }
 

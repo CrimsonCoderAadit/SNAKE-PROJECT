@@ -1,12 +1,3 @@
-// Fixed issues with chaos mode and multifruit mode
-
-// The main issue with multi-fruit mode was that the initialize_multi_fruits function
-// wasn't being properly called during mode initialization and food wasn't properly 
-// tracked across different modes
-
-// In chaos mode, there were several initialization issues and conflicts with 
-// how it handles multiple fruits and their movement
-
 #include <SDL.h>
 #include <SDL_ttf.h>
 #include <stdio.h>
@@ -35,9 +26,13 @@
 #define SCORE_SEGMENT_THICKNESS 3
 
 // Button dimensions
-#define BUTTON_WIDTH 300
+#define BUTTON_WIDTH 200
 #define BUTTON_HEIGHT 40
 #define BUTTON_PADDING 10
+
+// Checkbox dimensions
+#define CHECKBOX_SIZE 20
+#define CHECKBOX_PADDING 10
 
 // Max number of obstacles and foods
 #define MAX_OBSTACLES 30
@@ -50,15 +45,15 @@ typedef enum {
     GAME_OVER
 } GameState;
 
-// Game modes
-typedef enum {
-    CLASSIC,
-    TIMED,
-    OBSTACLES,
-    MOVING_FRUIT,
-    MULTI_FRUIT,
-    CHAOS
-} GameMode;
+// Game feature flags
+typedef struct {
+    bool movingFruit;
+    bool multiFruit;
+    bool timed;
+    bool obstacles;
+    bool speed;
+    bool chaos;
+} GameFeatures;
 
 typedef struct {
     int x, y;
@@ -81,12 +76,16 @@ typedef struct {
 
 typedef struct {
     int x, y;
+    int dx, dy;  // Direction for moving obstacles
+    bool moving; // Whether it moves
 } Obstacle;
 
 typedef struct {
     SDL_Rect rect;
     char text[30];
     bool hover;
+    bool checked;  // For checkboxes
+    bool isCheckbox;
 } Button;
 
 typedef struct {
@@ -97,6 +96,9 @@ typedef struct {
     bool hasObstacles;
     Obstacle obstacles[MAX_OBSTACLES];
     int obstacleCount;
+    bool movingObstacles;
+    int obstacleMoveInterval;
+    Uint32 lastObstacleMove;
     
     bool movingFruit;
     int fruitMoveInterval; // How often the fruit moves (in milliseconds)
@@ -106,7 +108,10 @@ typedef struct {
     Food foods[MAX_FOODS];
     int foodCount;
     
-    GameMode mode;
+    bool speed;
+    int updateDelay; // Basic snake speed
+    
+    char modeName[50]; // Name of the current mode configuration
 } GameConfig;
 
 // Function prototypes
@@ -119,25 +124,29 @@ void draw_digit(SDL_Renderer *renderer, int x, int y, int digit, int width, int 
 void draw_score(SDL_Renderer *renderer, int score, TTF_Font *font);
 void move_snake(Snake *snake);
 bool check_food_collision(Snake *snake, Food *food);
+bool check_obstacle_collision(Snake *snake, GameConfig *config);
 void place_food(Food *food, Snake *snake, GameConfig *config);
 void place_obstacles(GameConfig *config, Snake *snake);
 void grow_snake(Snake *snake);
-void init_button(Button *button, int x, int y, const char *text);
+void init_button(Button *button, int x, int y, const char *text, bool isCheckbox);
 void draw_button(SDL_Renderer *renderer, Button *button, TTF_Font *font);
+void draw_checkbox(SDL_Renderer *renderer, Button *checkbox, TTF_Font *font);
 bool is_point_in_rect(int x, int y, SDL_Rect *rect);
 void draw_text(SDL_Renderer *renderer, TTF_Font *font, const char *text, int x, int y, SDL_Color color);
 void draw_text_centered(SDL_Renderer *renderer, TTF_Font *font, const char *text, int x, int y, SDL_Color color);
-void draw_menu_screen(SDL_Renderer *renderer, Button buttons[], int buttonCount, TTF_Font *font);
+void draw_challenge_menu(SDL_Renderer *renderer, Button checkboxes[], int checkboxCount, 
+    Button *chaosButton, Button *playButton, Button *exitButton, TTF_Font *font);
 void draw_game_over_screen(SDL_Renderer *renderer, int score, Button *playAgainButton, Button *exitButton, TTF_Font *font);
 void reset_game(Snake *snake, GameConfig *config, int *score);
 void draw_ui_area(SDL_Renderer *renderer, int score, GameConfig *config, TTF_Font *font);
 void move_foods(GameConfig *config);
-void initialize_game_mode(GameConfig *config, GameMode mode, Snake *snake);
-void update_game(Snake *snake, GameConfig *config, int *score, Uint32 currentTime);
+void move_obstacles(GameConfig *config);
+void configure_game(GameConfig *config, GameFeatures *features, Snake *snake);
 void initialize_multi_fruits(GameConfig *config, Snake *snake);
+void update_game(Snake *snake, GameConfig *config, int *score, Uint32 currentTime);
+void generate_mode_name(GameConfig *config, GameFeatures *features);
 
-// Main function remains at the bottom
-
+// Drawing functions
 void draw_grid(SDL_Renderer *renderer) {
     SDL_SetRenderDrawColor(renderer, 50, 50, 50, 255);
 
@@ -211,9 +220,14 @@ void draw_food(SDL_Renderer *renderer, Food *food) {
 void draw_obstacles(SDL_Renderer *renderer, GameConfig *config) {
     if (!config->hasObstacles) return;
     
-    SDL_SetRenderDrawColor(renderer, 100, 100, 100, 255);
-    
     for (int i = 0; i < config->obstacleCount; i++) {
+        // Regular obstacles are gray, moving obstacles are dark red
+        if (config->obstacles[i].moving) {
+            SDL_SetRenderDrawColor(renderer, 150, 50, 50, 255);
+        } else {
+            SDL_SetRenderDrawColor(renderer, 100, 100, 100, 255);
+        }
+        
         SDL_Rect rect = {
             config->obstacles[i].x * CELL_SIZE,
             config->obstacles[i].y * CELL_SIZE + UI_HEIGHT,
@@ -302,13 +316,8 @@ void draw_ui_area(SDL_Renderer *renderer, int score, GameConfig *config, TTF_Fon
     draw_text(renderer, font, score_text, UI_PADDING, UI_HEIGHT / 2 - 10, white);
     
     // Draw game mode name
-    const char *mode_names[] = {
-        "CLASSIC MODE", "TIMED MODE", "OBSTACLES MODE", 
-        "MOVING FRUIT MODE", "MULTI FRUIT MODE", "CHAOS MODE"
-    };
-    
-    draw_text(renderer, font, mode_names[config->mode], 
-              WINDOW_WIDTH / 2 - 80, UI_HEIGHT / 2 - 10, white);
+    draw_text(renderer, font, config->modeName, 
+              WINDOW_WIDTH / 2 - 100, UI_HEIGHT / 2 - 10, white);
     
     // Draw time remaining for timed mode
     if (config->timed) {
@@ -318,13 +327,14 @@ void draw_ui_area(SDL_Renderer *renderer, int score, GameConfig *config, TTF_Fon
     }
 }
 
-// Modified score function now calls the UI area function
+// Legacy function for backwards compatibility
 void draw_score(SDL_Renderer *renderer, int score, TTF_Font *font) {
-    // This is a legacy function, kept for compatibility
     GameConfig config = {0};
+    strcpy(config.modeName, "CLASSIC");
     draw_ui_area(renderer, score, &config, font);
 }
 
+// Game logic functions
 void move_snake(Snake *snake) {
     // Move body segments
     for (int i = snake->length - 1; i > 0; i--) {
@@ -363,819 +373,842 @@ bool check_obstacle_collision(Snake *snake, GameConfig *config) {
             return true;
         }
     }
-    
     return false;
 }
 
-bool is_position_valid(int x, int y, Snake *snake, GameConfig *config) {
-    // Check if position is on the snake
-    for (int i = 0; i < snake->length; i++) {
-        if (x == snake->body[i].x && y == snake->body[i].y) {
-            return false;
-        }
-    }
-    
-    // Check if position is on an obstacle
-    if (config->hasObstacles) {
-        for (int i = 0; i < config->obstacleCount; i++) {
-            if (x == config->obstacles[i].x && y == config->obstacles[i].y) {
-                return false;
-            }
-        }
-    }
-    
-    // Check if position is on another food (for multi-fruit mode)
-    if (config->multiFruit) {
-        for (int i = 0; i < config->foodCount; i++) {
-            // Skip the food we're checking for
-            if (x == config->foods[i].x && y == config->foods[i].y) {
-                return false;
-            }
-        }
-    }
-    
-    return true;
-}
-
 void place_food(Food *food, Snake *snake, GameConfig *config) {
-    bool valid_position;
+    bool valid_position = false;
+    int x, y;
     
-    do {
+    while (!valid_position) {
+        x = rand() % GRID_WIDTH;
+        y = rand() % GRID_HEIGHT;
         valid_position = true;
-        food->x = rand() % GRID_WIDTH;
-        food->y = rand() % GRID_HEIGHT;
         
-        // Check if position is on the snake
+        // Check if the position is not occupied by the snake
         for (int i = 0; i < snake->length; i++) {
-            if (food->x == snake->body[i].x && food->y == snake->body[i].y) {
+            if (x == snake->body[i].x && y == snake->body[i].y) {
                 valid_position = false;
                 break;
             }
         }
         
-        // Check if position is on an obstacle
+        // Check if the position is not occupied by an obstacle
         if (valid_position && config->hasObstacles) {
             for (int i = 0; i < config->obstacleCount; i++) {
-                if (food->x == config->obstacles[i].x && food->y == config->obstacles[i].y) {
+                if (x == config->obstacles[i].x && y == config->obstacles[i].y) {
                     valid_position = false;
                     break;
                 }
             }
         }
         
-        // Check if position is on another food
+        // Check if the position is not occupied by another food item
         if (valid_position && config->multiFruit) {
             for (int i = 0; i < config->foodCount; i++) {
-                // Skip the current food item being placed
-                if (&config->foods[i] == food) continue;
-                
-                if (food->x == config->foods[i].x && food->y == config->foods[i].y) {
+                if (x == config->foods[i].x && y == config->foods[i].y) {
                     valid_position = false;
                     break;
                 }
             }
         }
-        
-    } while (!valid_position);
+    }
     
-    // Set random direction for moving fruits
-    if (food->moving) {
-        int dirs[4][2] = {{0, -1}, {1, 0}, {0, 1}, {-1, 0}}; // Up, Right, Down, Left
-        int dir = rand() % 4;
-        food->dx = dirs[dir][0];
-        food->dy = dirs[dir][1];
+    food->x = x;
+    food->y = y;
+    
+    // For moving fruit
+    if (config->movingFruit && food->moving) {
+        // Randomly assign an initial direction
+        do {
+            food->dx = (rand() % 3) - 1; // -1, 0, or 1
+            food->dy = (rand() % 3) - 1; // -1, 0, or 1
+        } while (food->dx == 0 && food->dy == 0); // Ensure it's not stationary
     }
 }
 
 void place_obstacles(GameConfig *config, Snake *snake) {
     if (!config->hasObstacles) return;
     
-    // Clear existing obstacles
-    config->obstacleCount = 0;
+    config->obstacleCount = rand() % (MAX_OBSTACLES / 2) + (MAX_OBSTACLES / 2); // 15-30 obstacles
     
-    // Create appropriate number of obstacles based on game mode
-    int numObstacles = (config->mode == CHAOS) ? MAX_OBSTACLES/2 : MAX_OBSTACLES/3;
-    
-    for (int i = 0; i < numObstacles; i++) {
-        bool valid_position;
+    for (int i = 0; i < config->obstacleCount; i++) {
+        bool valid_position = false;
         int x, y;
         
-        do {
-            valid_position = true;
+        while (!valid_position) {
             x = rand() % GRID_WIDTH;
             y = rand() % GRID_HEIGHT;
+            valid_position = true;
             
-            // Check if position is on the snake or too close to snake head
+            // Check if the position is not occupied by the snake
             for (int j = 0; j < snake->length; j++) {
-                if ((x == snake->body[j].x && y == snake->body[j].y) ||
-                    (abs(x - snake->body[0].x) + abs(y - snake->body[0].y) < 3)) {
+                if (x == snake->body[j].x && y == snake->body[j].y) {
                     valid_position = false;
                     break;
                 }
             }
             
-            // Check if position is on another obstacle
-            for (int j = 0; j < config->obstacleCount; j++) {
+            // Check if the position is not occupied by food
+            for (int j = 0; j < config->foodCount; j++) {
+                if (x == config->foods[j].x && y == config->foods[j].y) {
+                    valid_position = false;
+                    break;
+                }
+            }
+            
+            // Check if the position is not occupied by another obstacle
+            for (int j = 0; j < i; j++) {
                 if (x == config->obstacles[j].x && y == config->obstacles[j].y) {
                     valid_position = false;
                     break;
                 }
             }
             
-            // Check if position is on any food
-            if (config->multiFruit) {
-                for (int j = 0; j < config->foodCount; j++) {
-                    if (x == config->foods[j].x && y == config->foods[j].y) {
-                        valid_position = false;
-                        break;
-                    }
-                }
-            } else {
-                if (x == config->foods[0].x && y == config->foods[0].y) {
-                    valid_position = false;
-                }
+            // Make sure there's enough space around the snake's head
+            if (abs(x - snake->body[0].x) < 3 && abs(y - snake->body[0].y) < 3) {
+                valid_position = false;
             }
-            
-        } while (!valid_position);
-        
-        config->obstacles[config->obstacleCount].x = x;
-        config->obstacles[config->obstacleCount].y = y;
-        config->obstacleCount++;
-    }
-}
-
-void initialize_multi_fruits(GameConfig *config, Snake *snake) {
-    if (!config->multiFruit) return;
-    if (snake == NULL) return; // Add safety check
-    
-    // Set the appropriate number of foods based on game mode
-    config->foodCount = (config->mode == CHAOS) ? MAX_FOODS : 3;
-    
-    // Initialize each food item
-    for (int i = 0; i < config->foodCount; i++) {
-        // Set different values and types
-        switch (i) {
-            case 0:
-                config->foods[i].value = 10;  // Regular food
-                config->foods[i].type = 0;
-                break;
-            case 1:
-                config->foods[i].value = 20;  // Bonus food
-                config->foods[i].type = 1;
-                break;
-            case 2:
-                config->foods[i].value = 30;  // Special food
-                config->foods[i].type = 2;
-                break;
-            case 3:
-                config->foods[i].value = 50;  // Rare food
-                config->foods[i].type = 3;
-                break;
-            default:
-                config->foods[i].value = 10 * (i + 1);
-                config->foods[i].type = i % 4;
         }
         
-        // Set moving property based on game mode
-        config->foods[i].moving = config->movingFruit;
+        config->obstacles[i].x = x;
+        config->obstacles[i].y = y;
         
-        // Place food at valid position
-        place_food(&config->foods[i], snake, config);
-    }
-}
-
-void move_foods(GameConfig *config) {
-    if (!config->movingFruit) return;
-    
-    int foodCount = config->multiFruit ? config->foodCount : 1;
-    
-    for (int i = 0; i < foodCount; i++) {
-        Food *food = &config->foods[i];
-        
-        if (!food->moving) continue;
-        
-        // Try to move in current direction
-        int newX = food->x + food->dx;
-        int newY = food->y + food->dy;
-        
-        // If it would go off-grid, change direction
-        if (newX < 0 || newX >= GRID_WIDTH || newY < 0 || newY >= GRID_HEIGHT) {
-            // Choose a new random direction
-            int dirs[4][2] = {{0, -1}, {1, 0}, {0, 1}, {-1, 0}}; // Up, Right, Down, Left
-            int dir;
-            
-            // Find a valid direction that doesn't lead off-grid
+        // For moving obstacles
+        if (config->movingObstacles && rand() % 3 == 0) { // 1/3 chance to be moving
+            config->obstacles[i].moving = true;
+            // Randomly assign an initial direction
             do {
-                dir = rand() % 4;
-                food->dx = dirs[dir][0];
-                food->dy = dirs[dir][1];
-                newX = food->x + food->dx;
-                newY = food->y + food->dy;
-            } while (newX < 0 || newX >= GRID_WIDTH || newY < 0 || newY >= GRID_HEIGHT);
-        }
-        
-        // Check if new position would overlap with obstacles
-        bool collides = false;
-        if (config->hasObstacles) {
-            for (int j = 0; j < config->obstacleCount; j++) {
-                if (newX == config->obstacles[j].x && newY == config->obstacles[j].y) {
-                    collides = true;
-                    break;
-                }
-            }
-        }
-        
-        // Check if new position would overlap with other foods
-        if (!collides && config->multiFruit) {
-            for (int j = 0; j < config->foodCount; j++) {
-                if (i == j) continue; // Skip self
-                
-                if (newX == config->foods[j].x && newY == config->foods[j].y) {
-                    collides = true;
-                    break;
-                }
-            }
-        }
-        
-        // Only update position if no collision
-        if (!collides) {
-            food->x = newX;
-            food->y = newY;
+                config->obstacles[i].dx = (rand() % 3) - 1; // -1, 0, or 1
+                config->obstacles[i].dy = (rand() % 3) - 1; // -1, 0, or 1
+            } while (config->obstacles[i].dx == 0 && config->obstacles[i].dy == 0);
         } else {
-            // If collision, change direction
-            int dirs[4][2] = {{0, -1}, {1, 0}, {0, 1}, {-1, 0}};
-            int dir = rand() % 4;
-            food->dx = dirs[dir][0];
-            food->dy = dirs[dir][1];
+            config->obstacles[i].moving = false;
         }
     }
 }
 
 void grow_snake(Snake *snake) {
     if (snake->length < 100) {
-        // The new segment is initially placed at the same position as the last segment
-        // It will move correctly in the next frame
         snake->body[snake->length] = snake->body[snake->length - 1];
         snake->length++;
     }
 }
 
-// Initialize a button
-void init_button(Button *button, int x, int y, const char *text) {
-    button->rect.x = x;
-    button->rect.y = y;
-    button->rect.w = BUTTON_WIDTH;
-    button->rect.h = BUTTON_HEIGHT;
-    button->hover = false;
+void init_button(Button *button, int x, int y, const char *text, bool isCheckbox) {
+    if (isCheckbox) {
+        button->rect.x = x;
+        button->rect.y = y;
+        button->rect.w = CHECKBOX_SIZE;
+        button->rect.h = CHECKBOX_SIZE;
+    } else {
+        button->rect.x = x;
+        button->rect.y = y;
+        button->rect.w = BUTTON_WIDTH;
+        button->rect.h = BUTTON_HEIGHT;
+    }
+    
     strncpy(button->text, text, sizeof(button->text) - 1);
-    button->text[sizeof(button->text) - 1] = '\0'; // Ensure null termination
+    button->hover = false;
+    button->checked = false;
+    button->isCheckbox = isCheckbox;
 }
 
-// Draw a button with SDL_ttf
 void draw_button(SDL_Renderer *renderer, Button *button, TTF_Font *font) {
-    // Button background
+    if (button->isCheckbox) {
+        draw_checkbox(renderer, button, font);
+        return;
+    }
+    
+    // Draw button background
     if (button->hover) {
-        SDL_SetRenderDrawColor(renderer, 100, 150, 200, 255); // Highlight color when hovering
+        SDL_SetRenderDrawColor(renderer, 100, 100, 200, 255);
     } else {
-        SDL_SetRenderDrawColor(renderer, 70, 120, 170, 255); // Normal button color
+        SDL_SetRenderDrawColor(renderer, 60, 60, 150, 255);
     }
     SDL_RenderFillRect(renderer, &button->rect);
     
-    // Button border
-    SDL_SetRenderDrawColor(renderer, 40, 80, 120, 255);
+    // Draw button border
+    SDL_SetRenderDrawColor(renderer, 150, 150, 200, 255);
     SDL_RenderDrawRect(renderer, &button->rect);
     
-    // Button text with SDL_ttf
-    SDL_Color white = {255, 255, 255, 255};
+    // Draw button text
+    SDL_Color text_color = {255, 255, 255, 255};
     draw_text_centered(renderer, font, button->text, 
-                     button->rect.x + button->rect.w / 2, 
-                     button->rect.y + button->rect.h / 2, 
-                     white);
+                       button->rect.x + button->rect.w / 2, 
+                       button->rect.y + button->rect.h / 2, 
+                       text_color);
 }
 
-// Check if a point is inside a rectangle
+void draw_checkbox(SDL_Renderer *renderer, Button *checkbox, TTF_Font *font) {
+    // Draw checkbox border
+    SDL_SetRenderDrawColor(renderer, 150, 150, 200, 255);
+    SDL_RenderDrawRect(renderer, &checkbox->rect);
+    
+    // Draw checkbox background (filled if checked)
+    if (checkbox->hover && !checkbox->checked) {
+        SDL_SetRenderDrawColor(renderer, 80, 80, 150, 255);
+        SDL_Rect inner = {
+            checkbox->rect.x + 2,
+            checkbox->rect.y + 2,
+            checkbox->rect.w - 4,
+            checkbox->rect.h - 4
+        };
+        SDL_RenderFillRect(renderer, &inner);
+    } else if (checkbox->checked) {
+        SDL_SetRenderDrawColor(renderer, 100, 200, 100, 255);
+        SDL_Rect inner = {
+            checkbox->rect.x + 2,
+            checkbox->rect.y + 2,
+            checkbox->rect.w - 4,
+            checkbox->rect.h - 4
+        };
+        SDL_RenderFillRect(renderer, &inner);
+    }
+    
+    // Draw checkbox label
+    SDL_Color text_color = {255, 255, 255, 255};
+    draw_text(renderer, font, checkbox->text, 
+              checkbox->rect.x + checkbox->rect.w + CHECKBOX_PADDING, 
+              checkbox->rect.y + checkbox->rect.h / 2 - 10, 
+              text_color);
+}
+
 bool is_point_in_rect(int x, int y, SDL_Rect *rect) {
     return (x >= rect->x && x < rect->x + rect->w &&
             y >= rect->y && y < rect->y + rect->h);
 }
 
-// Draw text with SDL_ttf
 void draw_text(SDL_Renderer *renderer, TTF_Font *font, const char *text, int x, int y, SDL_Color color) {
-    SDL_Surface *surface = TTF_RenderText_Solid(font, text, color);
+    SDL_Surface *surface = TTF_RenderText_Blended(font, text, color);
     SDL_Texture *texture = SDL_CreateTextureFromSurface(renderer, surface);
     
-    SDL_Rect rect = {x, y, surface->w, surface->h};
-    SDL_RenderCopy(renderer, texture, NULL, &rect);
+    SDL_Rect dest = {x, y, surface->w, surface->h};
+    SDL_RenderCopy(renderer, texture, NULL, &dest);
     
     SDL_FreeSurface(surface);
     SDL_DestroyTexture(texture);
 }
 
-// Draw centered text with SDL_ttf
 void draw_text_centered(SDL_Renderer *renderer, TTF_Font *font, const char *text, int x, int y, SDL_Color color) {
-    SDL_Surface *surface = TTF_RenderText_Solid(font, text, color);
+    SDL_Surface *surface = TTF_RenderText_Blended(font, text, color);
     SDL_Texture *texture = SDL_CreateTextureFromSurface(renderer, surface);
     
-    SDL_Rect rect = {x - surface->w / 2, y - surface->h / 2, surface->w, surface->h};
-    SDL_RenderCopy(renderer, texture, NULL, &rect);
+    SDL_Rect dest = {x - surface->w / 2, y - surface->h / 2, surface->w, surface->h};
+    SDL_RenderCopy(renderer, texture, NULL, &dest);
     
     SDL_FreeSurface(surface);
     SDL_DestroyTexture(texture);
 }
+void draw_challenge_menu(SDL_Renderer *renderer, Button checkboxes[], int checkboxCount, 
+    Button *chaosButton, Button *playButton, Button *exitButton, TTF_Font *font) {
+// Draw background
+SDL_SetRenderDrawColor(renderer, 20, 20, 30, 255);
+SDL_RenderClear(renderer);
 
-// Draw menu screen with game mode buttons
-void draw_menu_screen(SDL_Renderer *renderer, Button buttons[], int buttonCount, TTF_Font *font) {
-    // Background
-    SDL_SetRenderDrawColor(renderer, 20, 20, 40, 255);
+// Draw title
+SDL_Color white = {255, 255, 255, 255};
+draw_text_centered(renderer, font, "SNAKE GAME CHALLENGES", WINDOW_WIDTH / 2, 60, white);
+
+// Draw checkboxes
+for (int i = 0; i < checkboxCount; i++) {
+draw_checkbox(renderer, &checkboxes[i], font);
+}
+
+// Draw chaos button
+draw_button(renderer, chaosButton, font);
+
+// Draw play and exit buttons
+draw_button(renderer, playButton, font);
+draw_button(renderer, exitButton, font);
+}
+void draw_game_over_screen(SDL_Renderer *renderer, int score, Button *playAgainButton, Button *exitButton, TTF_Font *font) {
+    // Draw background
+    SDL_SetRenderDrawColor(renderer, 20, 20, 30, 255);
     SDL_RenderClear(renderer);
     
-    // Title
-    SDL_Color green = {0, 200, 0, 255};
-    draw_text_centered(renderer, font, "SNAKE GAME CHALLENGE", 
-                     WINDOW_WIDTH / 2, 
-                     50, 
-                     green);
-    
-    // Subtitle
+    // Draw game over text
     SDL_Color white = {255, 255, 255, 255};
-    draw_text_centered(renderer, font, "SELECT GAME MODE:", 
-                     WINDOW_WIDTH / 2, 
-                     100, 
-                     white);
+    draw_text_centered(renderer, font, "GAME OVER", WINDOW_WIDTH / 2, WINDOW_HEIGHT / 3, white);
     
-    // Draw all buttons
-    for (int i = 0; i < buttonCount; i++) {
-        draw_button(renderer, &buttons[i], font);
-    }
-}
-
-// Draw game over screen with SDL_ttf
-void draw_game_over_screen(SDL_Renderer *renderer, int score, Button *playAgainButton, Button *exitButton, TTF_Font *font) {
-    // Semi-transparent overlay
-    SDL_SetRenderDrawColor(renderer, 0, 0, 0, 200);
-    SDL_Rect overlay = {0, 0, WINDOW_WIDTH, WINDOW_HEIGHT};
-    SDL_RenderFillRect(renderer, &overlay);
-    
-    // Game over text
-    SDL_Color red = {255, 0, 0, 255};
-    draw_text_centered(renderer, font, "GAME OVER", 
-                     WINDOW_WIDTH / 2, 
-                     WINDOW_HEIGHT / 4, 
-                     red);
-    
-    // Score text
+    // Draw score
     char score_text[32];
-    sprintf(score_text, "YOUR SCORE: %d", score);
-    SDL_Color white = {255, 255, 255, 255};
-    draw_text_centered(renderer, font, score_text, 
-                     WINDOW_WIDTH / 2, 
-                     WINDOW_HEIGHT / 3, 
-                     white);
+    sprintf(score_text, "SCORE: %d", score);
+    draw_text_centered(renderer, font, score_text, WINDOW_WIDTH / 2, WINDOW_HEIGHT / 2, white);
     
-    // Draw buttons with SDL_ttf
+    // Draw buttons
     draw_button(renderer, playAgainButton, font);
     draw_button(renderer, exitButton, font);
 }
 
-// Set up game configuration based on selected mode
-void initialize_game_mode(GameConfig *config, GameMode mode, Snake *snake) {
-    // Reset all settings
-    memset(config, 0, sizeof(GameConfig));
-    
-    config->mode = mode;
-    
-    switch (mode) {
-        case CLASSIC:
-            // Classic mode: No special features
-            config->timed = false;
-            config->hasObstacles = false;
-            config->movingFruit = false;
-            config->multiFruit = false;
-            
-            // Initialize single food
-            config->foodCount = 1;
-            config->foods[0].value = 10;
-            config->foods[0].type = 0;
-            config->foods[0].moving = false;
-            place_food(&config->foods[0], snake, config);
-            break;
-            
-        case TIMED:
-            // Timed mode: Limited time to get as many points as possible
-            config->timed = true;
-            config->timeRemaining = 60; // 60 seconds
-            config->maxTime = 60;
-            config->hasObstacles = false;
-            config->movingFruit = false;
-            config->multiFruit = false;
-            
-            // Initialize single food
-            config->foodCount = 1;
-            config->foods[0].value = 10;
-            config->foods[0].type = 0;
-            config->foods[0].moving = false;
-            place_food(&config->foods[0], snake, config);
-            break;
-            
-        case OBSTACLES:
-            // Obstacles mode: Static obstacles on the grid
-            config->timed = false;
-            config->hasObstacles = true;
-            config->movingFruit = false;
-            config->multiFruit = false;
-            
-            // Place obstacles
-            place_obstacles(config, snake);
-            
-            // Initialize single food
-            config->foodCount = 1;
-            config->foods[0].value = 10;
-            config->foods[0].type = 0;
-            config->foods[0].moving = false;
-            place_food(&config->foods[0], snake, config);
-            break;
-            
-        case MOVING_FRUIT:
-            // Moving fruit mode: Fruit moves around the grid
-            config->timed = false;
-            config->hasObstacles = false;
-            config->movingFruit = true;
-            config->multiFruit = false;
-            config->fruitMoveInterval = 500; // Move every 500ms
-            
-            // Initialize single moving food
-            config->foodCount = 1;
-            config->foods[0].value = 10;
-            config->foods[0].type = 0;
-            config->foods[0].moving = true;
-            place_food(&config->foods[0], snake, config);
-            break;
-            
-        case MULTI_FRUIT:
-            // Multi-fruit mode: Multiple fruits with different values
-            config->timed = false;
-            config->hasObstacles = false;
-            config->movingFruit = false;
-            config->multiFruit = true;
-            
-            // Initialize multiple fruits
-            initialize_multi_fruits(config, snake);
-            break;
-            
-        case CHAOS:
-            // Chaos mode: Combines all challenges
-            config->timed = true;
-            config->timeRemaining = 90; // 90 seconds
-            config->maxTime = 90;
-            config->hasObstacles = true;
-            config->movingFruit = true;
-            config->multiFruit = true;
-            config->fruitMoveInterval = 300; // Move faster than normal
-            
-            // Place obstacles
-            place_obstacles(config, snake);
-            
-            // Initialize multiple moving fruits
-            initialize_multi_fruits(config, snake);
-            break;
-    }
-}
-
-// Update game state
-void update_game(Snake *snake, GameConfig *config, int *score, Uint32 currentTime) {
-    // Check for obstacle collision
-    if (check_obstacle_collision(snake, config)) {
-        snake->alive = false;
-        return;
-    }
-    
-    // Check for food collision
-    if (config->multiFruit) {
-        for (int i = 0; i < config->foodCount; i++) {
-            if (check_food_collision(snake, &config->foods[i])) {
-                // Add score based on food value
-                *score += config->foods[i].value;
-                
-                // Grow the snake
-                grow_snake(snake);
-                
-                // Place new food
-                place_food(&config->foods[i], snake, config);
-                
-                // In timed mode, eating food gives more time
-                if (config->timed) {
-                    config->timeRemaining += 5; // Add 5 seconds
-                    if (config->timeRemaining > config->maxTime) {
-                        config->timeRemaining = config->maxTime;
-                    }
-                }
-                
-                break;
-            }
-        }
-    } else {
-        // Simple single-food logic
-        if (check_food_collision(snake, &config->foods[0])) {
-            *score += config->foods[0].value;
-            grow_snake(snake);
-            place_food(&config->foods[0], snake, config);
-            
-            // In timed mode, eating food gives more time
-            if (config->timed) {
-                config->timeRemaining += 5; // Add 5 seconds
-                if (config->timeRemaining > config->maxTime) {
-                    config->timeRemaining = config->maxTime;
-                }
-            }
-        }
-    }
-    
-    // Move food if it's time
-    if (config->movingFruit && currentTime - config->lastFruitMove >= config->fruitMoveInterval) {
-        move_foods(config);
-        config->lastFruitMove = currentTime;
-    }
-}
-
-// Reset all game variables to start a new game
 void reset_game(Snake *snake, GameConfig *config, int *score) {
-    // Reset score
-    *score = 0;
-    
     // Reset snake
     snake->length = 3;
+    snake->body[0].x = GRID_WIDTH / 2;
+    snake->body[0].y = GRID_HEIGHT / 2;
+    snake->body[1].x = GRID_WIDTH / 2 - 1;
+    snake->body[1].y = GRID_HEIGHT / 2;
+    snake->body[2].x = GRID_WIDTH / 2 - 2;
+    snake->body[2].y = GRID_HEIGHT / 2;
     snake->dx = 1;
     snake->dy = 0;
     snake->alive = true;
     
-    // Place snake in the middle of the grid
-    snake->body[0].x = GRID_WIDTH / 4;
-    snake->body[0].y = GRID_HEIGHT / 2;
+    // Reset score
+    *score = 0;
     
-    for (int i = 1; i < snake->length; i++) {
-        snake->body[i].x = snake->body[0].x - i;
-        snake->body[i].y = snake->body[0].y;
+    // Reset time for timed mode
+    if (config->timed) {
+        config->timeRemaining = config->maxTime;
     }
     
-    // Reset current mode
-    initialize_game_mode(config, config->mode, snake);
+    // Place obstacles
+    if (config->hasObstacles) {
+        place_obstacles(config, snake);
+    }
+    
+    // Place food items
+    if (config->multiFruit) {
+        initialize_multi_fruits(config, snake);
+    } else {
+        config->foodCount = 1;
+        config->foods[0].type = 0;  // Regular food
+        config->foods[0].value = 1;
+        config->foods[0].moving = config->movingFruit;
+        place_food(&config->foods[0], snake, config);
+    }
 }
 
-int main(int argc, char* args[]) {
+void move_foods(GameConfig *config) {
+    if (!config->movingFruit) return;
+    
+    for (int i = 0; i < config->foodCount; i++) {
+        if (config->foods[i].moving) {
+            int new_x = config->foods[i].x + config->foods[i].dx;
+            int new_y = config->foods[i].y + config->foods[i].dy;
+            
+            // Check if the food would go out of bounds and change direction if needed
+            if (new_x < 0 || new_x >= GRID_WIDTH) {
+                config->foods[i].dx *= -1;
+                new_x = config->foods[i].x + config->foods[i].dx;
+            }
+            
+            if (new_y < 0 || new_y >= GRID_HEIGHT) {
+                config->foods[i].dy *= -1;
+                new_y = config->foods[i].y + config->foods[i].dy;
+            }
+            
+            // Check if the food would collide with an obstacle
+            bool collision = false;
+            if (config->hasObstacles) {
+                for (int j = 0; j < config->obstacleCount; j++) {
+                    if (new_x == config->obstacles[j].x && new_y == config->obstacles[j].y) {
+                        collision = true;
+                        break;
+                    }
+                }
+            }
+            
+            // If no collision, update the position
+            if (!collision) {
+                config->foods[i].x = new_x;
+                config->foods[i].y = new_y;
+            } else {
+                // Otherwise, change direction
+                config->foods[i].dx *= -1;
+                config->foods[i].dy *= -1;
+            }
+        }
+    }
+}
+
+void move_obstacles(GameConfig *config) {
+    if (!config->movingObstacles) return;
+    
+    for (int i = 0; i < config->obstacleCount; i++) {
+        if (config->obstacles[i].moving) {
+            int new_x = config->obstacles[i].x + config->obstacles[i].dx;
+            int new_y = config->obstacles[i].y + config->obstacles[i].dy;
+            
+            // Check if the obstacle would go out of bounds and change direction if needed
+            if (new_x < 0 || new_x >= GRID_WIDTH) {
+                config->obstacles[i].dx *= -1;
+                new_x = config->obstacles[i].x + config->obstacles[i].dx;
+            }
+            
+            if (new_y < 0 || new_y >= GRID_HEIGHT) {
+                config->obstacles[i].dy *= -1;
+                new_y = config->obstacles[i].y + config->obstacles[i].dy;
+            }
+            
+            // Check for collisions with other obstacles
+            bool collision = false;
+            for (int j = 0; j < config->obstacleCount; j++) {
+                if (i != j && new_x == config->obstacles[j].x && new_y == config->obstacles[j].y) {
+                    collision = true;
+                    break;
+                }
+            }
+            
+            // Check for collisions with food
+            for (int j = 0; j < config->foodCount; j++) {
+                if (new_x == config->foods[j].x && new_y == config->foods[j].y) {
+                    collision = true;
+                    break;
+                }
+            }
+            
+            // If no collision, update the position
+            if (!collision) {
+                config->obstacles[i].x = new_x;
+                config->obstacles[i].y = new_y;
+            } else {
+                // Otherwise, change direction
+                config->obstacles[i].dx *= -1;
+                config->obstacles[i].dy *= -1;
+            }
+        }
+    }
+}
+
+void configure_game(GameConfig *config, GameFeatures *features, Snake *snake) {
+    // Reset config to defaults
+    memset(config, 0, sizeof(GameConfig));
+    
+    // Apply feature settings
+    config->movingFruit = features->movingFruit;
+    config->multiFruit = features->multiFruit;
+    config->timed = features->timed;
+    config->hasObstacles = features->obstacles;
+    config->movingObstacles = features->obstacles && features->movingFruit; // Only if both are selected
+    
+    // Set base speed
+    if (features->speed) {
+        config->updateDelay = 100; // Faster speed
+    } else {
+        config->updateDelay = 150; // Normal speed
+    }
+    
+    // Configure timed mode
+    if (config->timed) {
+        config->maxTime = 60; // 60 seconds
+        config->timeRemaining = config->maxTime;
+    }
+    
+    // Configure food movement
+    if (config->movingFruit) {
+        config->fruitMoveInterval = 500; // Move every 500ms
+    }
+    
+    // Configure obstacle movement
+    if (config->movingObstacles) {
+        config->obstacleMoveInterval = 800; // Move every 800ms
+    }
+    
+    // Generate a name for this mode configuration
+    generate_mode_name(config, features);
+}
+
+void initialize_multi_fruits(GameConfig *config, Snake *snake) {
+    if (!config->multiFruit) {
+        config->foodCount = 1;
+        config->foods[0].type = 0;  // Regular food
+        config->foods[0].value = 1;
+        config->foods[0].moving = config->movingFruit;
+        place_food(&config->foods[0], snake, config);
+        return;
+    }
+    
+    // For multi-fruit mode, place 3-5 fruits
+    config->foodCount = rand() % 3 + 3; // 3-5 fruits
+    
+    for (int i = 0; i < config->foodCount; i++) {
+        config->foods[i].type = rand() % 4; // 0-3 different types
+        
+        // Set point value based on type
+        switch (config->foods[i].type) {
+            case 0: config->foods[i].value = 1; break;  // Regular
+            case 1: config->foods[i].value = 2; break;  // Bonus
+            case 2: config->foods[i].value = 3; break;  // Special
+            case 3: config->foods[i].value = 5; break;  // Rare
+        }
+        
+        // Determine if this fruit should move (if moving fruit is enabled)
+        if (config->movingFruit) {
+            // Higher value fruits are more likely to move
+            config->foods[i].moving = (rand() % 5 < config->foods[i].type + 2);
+        } else {
+            config->foods[i].moving = false;
+        }
+        
+        place_food(&config->foods[i], snake, config);
+    }
+}
+
+void update_game(Snake *snake, GameConfig *config, int *score, Uint32 currentTime) {
+    // Update moving fruits
+    if (config->movingFruit && currentTime - config->lastFruitMove > config->fruitMoveInterval) {
+        move_foods(config);
+        config->lastFruitMove = currentTime;
+    }
+    
+    // Update moving obstacles
+    if (config->movingObstacles && currentTime - config->lastObstacleMove > config->obstacleMoveInterval) {
+        move_obstacles(config);
+        config->lastObstacleMove = currentTime;
+    }
+    
+    // Update timer
+    if (config->timed && config->timeRemaining > 0) {
+        config->timeRemaining = config->maxTime - (currentTime / 1000);
+        if (config->timeRemaining <= 0) {
+            snake->alive = false;
+        }
+    }
+}
+
+void generate_mode_name(GameConfig *config, GameFeatures *features) {
+    strcpy(config->modeName, "");
+    
+    // Check if chaos mode (everything enabled)
+    if (features->movingFruit && features->multiFruit && features->timed && 
+        features->obstacles && features->speed) {
+        strcpy(config->modeName, "CHAOS MODE");
+        return;
+    }
+    
+    // Otherwise, build the name based on enabled features
+    if (!features->movingFruit && !features->multiFruit && !features->timed && 
+        !features->obstacles && !features->speed) {
+        strcpy(config->modeName, "CLASSIC");
+        return;
+    }
+    
+    // Build the name from enabled features
+    bool addedFeature = false;
+    
+    if (features->speed) {
+        strcat(config->modeName, "SPEED");
+        addedFeature = true;
+    }
+    
+    if (features->timed) {
+        if (addedFeature) strcat(config->modeName, "+");
+        strcat(config->modeName, "TIMED");
+        addedFeature = true;
+    }
+    
+    if (features->obstacles) {
+        if (addedFeature) strcat(config->modeName, "+");
+        if (features->movingFruit) {
+            strcat(config->modeName, "MVG-");
+        }
+        strcat(config->modeName, "OBSTACLE");
+        addedFeature = true;
+    }
+    
+    if (features->multiFruit) {
+        if (addedFeature) strcat(config->modeName, "+");
+        strcat(config->modeName, "MULTI-FRUIT");
+        addedFeature = true;
+    } else if (features->movingFruit) {
+        if (addedFeature) strcat(config->modeName, "+");
+        strcat(config->modeName, "MVG-FRUIT");
+    }
+}
+
+// Main function for the Challenge Menu
+int main(int argc, char *argv[]) {
     // Initialize SDL
-    if (SDL_Init(SDL_INIT_VIDEO) < 0) {
-        printf("SDL could not initialize! SDL_Error: %s\n", SDL_GetError());
+    if (SDL_Init(SDL_INIT_VIDEO) != 0) {
+        printf("SDL_Init Error: %s\n", SDL_GetError());
         return 1;
     }
     
     // Initialize SDL_ttf
-    if (TTF_Init() < 0) {
-        printf("SDL_ttf could not initialize! TTF_Error: %s\n", TTF_GetError());
+    if (TTF_Init() != 0) {
+        printf("TTF_Init Error: %s\n", TTF_GetError());
+        SDL_Quit();
         return 1;
     }
     
     // Create window
-    SDL_Window* window = SDL_CreateWindow("Snake Game Challenge", 
-                                         SDL_WINDOWPOS_UNDEFINED, 
-                                         SDL_WINDOWPOS_UNDEFINED, 
-                                         WINDOW_WIDTH, 
-                                         WINDOW_HEIGHT, 
-                                         SDL_WINDOW_SHOWN);
-    
+    SDL_Window *window = SDL_CreateWindow("Snake Game Challenges", 
+                                          SDL_WINDOWPOS_CENTERED, 
+                                          SDL_WINDOWPOS_CENTERED, 
+                                          WINDOW_WIDTH, 
+                                          WINDOW_HEIGHT, 
+                                          SDL_WINDOW_SHOWN);
     if (window == NULL) {
-        printf("Window could not be created! SDL_Error: %s\n", SDL_GetError());
+        printf("SDL_CreateWindow Error: %s\n", SDL_GetError());
+        TTF_Quit();
+        SDL_Quit();
         return 1;
     }
     
     // Create renderer
-    SDL_Renderer* renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
+    SDL_Renderer *renderer = SDL_CreateRenderer(window, -1, 
+                                               SDL_RENDERER_ACCELERATED | 
+                                               SDL_RENDERER_PRESENTVSYNC);
     if (renderer == NULL) {
-        printf("Renderer could not be created! SDL_Error: %s\n", SDL_GetError());
+        printf("SDL_CreateRenderer Error: %s\n", SDL_GetError());
+        SDL_DestroyWindow(window);
+        TTF_Quit();
+        SDL_Quit();
         return 1;
     }
     
-    // Create font
-    TTF_Font* font = TTF_OpenFont("arial.ttf", 24);
+    // Load font
+    TTF_Font *font = TTF_OpenFont("dejavu-fonts-ttf-2.37/ttf/DejaVuSans.ttf", 24);
     if (font == NULL) {
-        printf("Font could not be loaded! TTF_Error: %s\n", TTF_GetError());
-        // Fall back to default system font if possible
-        font = TTF_OpenFont("/System/Library/Fonts/Supplemental/Arial.ttf", 24);
-        if (font == NULL) {
-            // Try another fallback
-            font = TTF_OpenFont("/usr/share/fonts/truetype/freefont/FreeSans.ttf", 24);
-            if (font == NULL) {
-                printf("Fallback fonts also failed! TTF_Error: %s\n", TTF_GetError());
-                return 1;
-            }
-        }
+        printf("TTF_OpenFont Error: %s\n", TTF_GetError());
+        SDL_DestroyRenderer(renderer);
+        SDL_DestroyWindow(window);
+        TTF_Quit();
+        SDL_Quit();
+        return 1;
     }
     
-    // Seed random number generator
+    // Initialize random number generator
     srand(time(NULL));
     
-    // Initialize game objects
+    // Create game objects
     Snake snake = {0};
-    snake.length = 3;
-    snake.dx = 1;
-    snake.dy = 0;
-    snake.alive = true;
-    
-    // Place snake in the middle of the grid
-    snake.body[0].x = GRID_WIDTH / 4;
-    snake.body[0].y = GRID_HEIGHT / 2;
-    
-    for (int i = 1; i < snake.length; i++) {
-        snake.body[i].x = snake.body[0].x - i;
-        snake.body[i].y = snake.body[0].y;
-    }
-    
-    // Game configuration
     GameConfig config = {0};
-    config.mode = CLASSIC; // Default mode
-    
-    // Generate food
-    place_food(&config.foods[0], &snake, &config);
+    GameFeatures features = {0};
+    int score = 0;
+    GameState gameState = MENU;
     
     // Create menu buttons
-    Button modeButtons[6];
-    const char* modeNames[] = {
-        "CLASSIC MODE",
-        "TIMED MODE",
-        "OBSTACLES MODE",
-        "MOVING FRUIT MODE",
-        "MULTI-FRUIT MODE",
-        "CHAOS MODE"
-    };
+    Button checkboxes[5]; // 5 challenge options
+    init_button(&checkboxes[0], WINDOW_WIDTH / 2 - 100, 120, "Moving Fruit", true);
+    init_button(&checkboxes[1], WINDOW_WIDTH / 2 - 100, 160, "Multi-Fruit", true);
+    init_button(&checkboxes[2], WINDOW_WIDTH / 2 - 100, 200, "Timed Mode", true);
+    init_button(&checkboxes[3], WINDOW_WIDTH / 2 - 100, 240, "Speed Mode", true);
+    init_button(&checkboxes[4], WINDOW_WIDTH / 2 - 100, 280, "Moving Obstacle", true);
     
-    for (int i = 0; i < 6; i++) {
-        init_button(&modeButtons[i], 
-                  (WINDOW_WIDTH - BUTTON_WIDTH) / 2, 
-                  150 + i * (BUTTON_HEIGHT + BUTTON_PADDING), 
-                  modeNames[i]);
-    }
+    Button chaosButton;
+    init_button(&chaosButton, WINDOW_WIDTH / 2 - 100, 330, "CHAOS MODE (Everything!)", false);
     
-    // Create game over buttons
-    Button playAgainButton, exitButton;
-    init_button(&playAgainButton, 
-              (WINDOW_WIDTH - BUTTON_WIDTH) / 2, 
-              WINDOW_HEIGHT / 2, 
-              "PLAY AGAIN");
-              
-    init_button(&exitButton, 
-              (WINDOW_WIDTH - BUTTON_WIDTH) / 2, 
-              WINDOW_HEIGHT / 2 + BUTTON_HEIGHT + BUTTON_PADDING, 
-              "EXIT TO MENU");
+    Button playButton;
+    init_button(&playButton, WINDOW_WIDTH / 2 - 100, 400, "PLAY", false);
     
-    // Game variables
-    GameState gameState = MENU;
-    int score = 0;
-    bool quit = false;
-    Uint32 lastUpdateTime = 0;
-    int updateDelay = 150; // snake speed (lower = faster)
-    Uint32 lastSecondTick = 0;
+    Button exitButton;
+    init_button(&exitButton, WINDOW_WIDTH / 2 - 100, 450, "EXIT", false);
     
-    // Event loop
-    SDL_Event e;
-    while (!quit) {
-        // Handle events
-        while (SDL_PollEvent(&e)) {
-            if (e.type == SDL_QUIT) {
-                quit = true;
-            } else if (e.type == SDL_KEYDOWN) {
-                switch (e.key.keysym.sym) {
-                    case SDLK_UP:
-                        if (snake.dy != 1 && gameState == PLAYING) { // Prevent 180-degree turns
-                            snake.dx = 0;
-                            snake.dy = -1;
-                        }
-                        break;
-                    case SDLK_DOWN:
-                        if (snake.dy != -1 && gameState == PLAYING) {
-                            snake.dx = 0;
-                            snake.dy = 1;
-                        }
-                        break;
-                    case SDLK_LEFT:
-                        if (snake.dx != 1 && gameState == PLAYING) {
-                            snake.dx = -1;
-                            snake.dy = 0;
-                        }
-                        break;
-                    case SDLK_RIGHT:
-                        if (snake.dx != -1 && gameState == PLAYING) {
-                            snake.dx = 1;
-                            snake.dy = 0;
-                        }
-                        break;
-                    case SDLK_ESCAPE:
-                        if (gameState == PLAYING) {
-                            gameState = MENU;
-                        } else if (gameState == MENU) {
-                            quit = true;
-                        }
-                        break;
-                }
-            } else if (e.type == SDL_MOUSEMOTION) {
-                // Check button hover states
-                int mouseX = e.motion.x;
-                int mouseY = e.motion.y;
-                
-                if (gameState == MENU) {
-                    for (int i = 0; i < 6; i++) {
-                        modeButtons[i].hover = is_point_in_rect(mouseX, mouseY, &modeButtons[i].rect);
-                    }
-                } else if (gameState == GAME_OVER) {
-                    playAgainButton.hover = is_point_in_rect(mouseX, mouseY, &playAgainButton.rect);
-                    exitButton.hover = is_point_in_rect(mouseX, mouseY, &exitButton.rect);
-                }
-            } else if (e.type == SDL_MOUSEBUTTONDOWN) {
-                if (e.button.button == SDL_BUTTON_LEFT) {
-                    int mouseX = e.button.x;
-                    int mouseY = e.button.y;
-                    
-                    if (gameState == MENU) {
-                        for (int i = 0; i < 6; i++) {
-                            if (is_point_in_rect(mouseX, mouseY, &modeButtons[i].rect)) {
-                                // Start game with selected mode
-                                config.mode = (GameMode)i;
-                                initialize_game_mode(&config, config.mode, &snake);
-                                reset_game(&snake, &config, &score);
-                                gameState = PLAYING;
-                                lastUpdateTime = SDL_GetTicks();
-                                lastSecondTick = lastUpdateTime;
+    Button playAgainButton;
+    init_button(&playAgainButton, WINDOW_WIDTH / 2 - 100, 400, "PLAY AGAIN", false);
+    
+    Uint32 lastUpdate = 0;
+    Uint32 lastFPSUpdate = 0;
+    int frames = 0;
+    int fps = 0;
+    
+    // Main game loop
+    bool running = true;
+    SDL_Event event;
+    
+    while (running) {
+        // Process events
+        while (SDL_PollEvent(&event)) {
+            switch (event.type) {
+                case SDL_QUIT:
+                    running = false;
+                    break;
+                case SDL_KEYDOWN:
+                    if (gameState == PLAYING) {
+                        switch (event.key.keysym.sym) {
+                            case SDLK_UP:
+                                if (snake.dy != 1) { // Prevent moving directly backwards
+                                    snake.dx = 0;
+                                    snake.dy = -1;
+                                }
                                 break;
+                            case SDLK_DOWN:
+                                if (snake.dy != -1) {
+                                    snake.dx = 0;
+                                    snake.dy = 1;
+                                }
+                                break;
+                            case SDLK_LEFT:
+                                if (snake.dx != 1) {
+                                    snake.dx = -1;
+                                    snake.dy = 0;
+                                }
+                                break;
+                            case SDLK_RIGHT:
+                                if (snake.dx != -1) {
+                                    snake.dx = 1;
+                                    snake.dy = 0;
+                                }
+                                break;
+                            case SDLK_ESCAPE:
+                                gameState = MENU;
+                                break;
+                        }
+                    }
+                    break;
+                case SDL_MOUSEMOTION:
+                    // Update button hover state
+                    if (gameState == MENU) {
+                        int mouseX = event.motion.x;
+                        int mouseY = event.motion.y;
+                        
+                        for (int i = 0; i < 5; i++) {
+                            checkboxes[i].hover = is_point_in_rect(mouseX, mouseY, &checkboxes[i].rect);
+                        }
+                        
+                        chaosButton.hover = is_point_in_rect(mouseX, mouseY, &chaosButton.rect);
+                        playButton.hover = is_point_in_rect(mouseX, mouseY, &playButton.rect);
+                        exitButton.hover = is_point_in_rect(mouseX, mouseY, &exitButton.rect);
+                    } else if (gameState == GAME_OVER) {
+                        int mouseX = event.motion.x;
+                        int mouseY = event.motion.y;
+                        
+                        playAgainButton.hover = is_point_in_rect(mouseX, mouseY, &playAgainButton.rect);
+                        exitButton.hover = is_point_in_rect(mouseX, mouseY, &exitButton.rect);
+                    }
+                    break;
+                case SDL_MOUSEBUTTONDOWN:
+                    if (event.button.button == SDL_BUTTON_LEFT) {
+                        int mouseX = event.button.x;
+                        int mouseY = event.button.y;
+                        
+                        if (gameState == MENU) {
+                            // Check challenge checkboxes
+                            for (int i = 0; i < 5; i++) {
+                                if (is_point_in_rect(mouseX, mouseY, &checkboxes[i].rect)) {
+                                    checkboxes[i].checked = !checkboxes[i].checked;
+                                }
+                            }
+                            
+                            // Check chaos button
+                            if (is_point_in_rect(mouseX, mouseY, &chaosButton.rect)) {
+                                // Enable all features
+                                for (int i = 0; i < 5; i++) {
+                                    checkboxes[i].checked = true;
+                                }
+                            }
+                            
+                            // Check play button
+                            if (is_point_in_rect(mouseX, mouseY, &playButton.rect)) {
+                                // Configure game features based on checkboxes
+                                features.movingFruit = checkboxes[0].checked;
+                                features.multiFruit = checkboxes[1].checked;
+                                features.timed = checkboxes[2].checked;
+                                features.speed = checkboxes[3].checked;
+                                features.obstacles = checkboxes[4].checked;
+                                features.chaos = checkboxes[0].checked && 
+                                                checkboxes[1].checked && 
+                                                checkboxes[2].checked && 
+                                                checkboxes[3].checked && 
+                                                checkboxes[4].checked;
+                                
+                                // Configure the game based on selected features
+                                configure_game(&config, &features, &snake);
+                                
+                                // Reset the game
+                                reset_game(&snake, &config, &score);
+                                
+                                // Set last update times for moving objects
+                                config.lastFruitMove = SDL_GetTicks();
+                                config.lastObstacleMove = SDL_GetTicks();
+                                
+                                // Switch to playing state
+                                gameState = PLAYING;
+                            }
+                            
+                            // Check exit button
+                            if (is_point_in_rect(mouseX, mouseY, &exitButton.rect)) {
+                                running = false;
+                            }
+                        } else if (gameState == GAME_OVER) {
+                            // Check play again button
+                            if (is_point_in_rect(mouseX, mouseY, &playAgainButton.rect)) {
+                                gameState = MENU;
+                            }
+                            
+                            // Check exit button
+                            if (is_point_in_rect(mouseX, mouseY, &exitButton.rect)) {
+                                running = false;
                             }
                         }
-                    } else if (gameState == GAME_OVER) {
-                        if (is_point_in_rect(mouseX, mouseY, &playAgainButton.rect)) {
-                            // Restart game with same mode
-                            reset_game(&snake, &config, &score);
-                            gameState = PLAYING;
-                            lastUpdateTime = SDL_GetTicks();
-                            lastSecondTick = lastUpdateTime;
-                        } else if (is_point_in_rect(mouseX, mouseY, &exitButton.rect)) {
-                            gameState = MENU;
-                        }
                     }
-                }
+                    break;
             }
         }
         
-        // Get current time
         Uint32 currentTime = SDL_GetTicks();
         
-        // Update timer for timed mode
-        if (gameState == PLAYING && config.timed) {
-            if (currentTime - lastSecondTick >= 1000) { // 1 second has passed
-                config.timeRemaining--;
-                lastSecondTick = currentTime;
+        // Update game state
+        if (gameState == PLAYING) {
+            // Update at appropriate intervals based on speed setting
+            if (currentTime - lastUpdate > config.updateDelay) {
+                // Move the snake
+                move_snake(&snake);
                 
-                // Check if time is up
-                if (config.timeRemaining <= 0) {
+                // Check for obstacle collision
+                if (check_obstacle_collision(&snake, &config)) {
                     snake.alive = false;
                 }
-            }
-        }
-        
-        // Game update logic
-        if (gameState == PLAYING && currentTime - lastUpdateTime >= updateDelay) {
-            move_snake(&snake);
-            
-            if (snake.alive) {
+                
+                // Check for food collision and handle multiple food types
+                for (int i = 0; i < config.foodCount; i++) {
+                    if (check_food_collision(&snake, &config.foods[i])) {
+                        // Increase score based on food value
+                        score += config.foods[i].value;
+                        
+                        // Grow snake
+                        grow_snake(&snake);
+                        
+                        // Replace eaten food
+                        place_food(&config.foods[i], &snake, &config);
+                    }
+                }
+                
+                // Update game elements (moving fruits, obstacles, timer)
                 update_game(&snake, &config, &score, currentTime);
-            } else {
-                gameState = GAME_OVER;
+                
+                // Check if game over
+                if (!snake.alive) {
+                    gameState = GAME_OVER;
+                }
+                
+                lastUpdate = currentTime;
             }
-            
-            lastUpdateTime = currentTime;
         }
         
-        // Rendering
+        // Calculate FPS
+        frames++;
+        if (currentTime - lastFPSUpdate >= 1000) {
+            fps = frames;
+            frames = 0;
+            lastFPSUpdate = currentTime;
+        }
+        
+        // Clear screen
         SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
         SDL_RenderClear(renderer);
         
+        // Render game elements based on game state
         switch (gameState) {
             case MENU:
-                draw_menu_screen(renderer, modeButtons, 6, font);
+                draw_challenge_menu(renderer, checkboxes, 5, &chaosButton, &playButton, &exitButton, font);
                 break;
+            
                 
             case PLAYING:
-                // Draw UI (includes score)
                 draw_ui_area(renderer, score, &config, font);
-                
-                // Draw grid
                 draw_grid(renderer);
                 
-                // Draw obstacles
-                draw_obstacles(renderer, &config);
+                // Draw all food items
+                for (int i = 0; i < config.foodCount; i++) {
+                    draw_food(renderer, &config.foods[i]);
+                }
                 
-                // Draw food(s)
-                if (config.multiFruit) {
-                    for (int i = 0; i < config.foodCount; i++) {
-                        draw_food(renderer, &config.foods[i]);
-                    }
-                } else {
-                    draw_food(renderer, &config.foods[0]);
+                // Draw obstacles if enabled
+                if (config.hasObstacles) {
+                    draw_obstacles(renderer, &config);
                 }
                 
                 // Draw snake
@@ -1183,31 +1216,26 @@ int main(int argc, char* args[]) {
                 break;
                 
             case GAME_OVER:
-                // First draw the game state behind the overlay
-                draw_ui_area(renderer, score, &config, font);
-                draw_grid(renderer);
-                draw_obstacles(renderer, &config);
-                
-                if (config.multiFruit) {
-                    for (int i = 0; i < config.foodCount; i++) {
-                        draw_food(renderer, &config.foods[i]);
-                    }
-                } else {
-                    draw_food(renderer, &config.foods[0]);
-                }
-                
-                draw_snake(renderer, &snake);
-                
-                // Then draw the game over screen
                 draw_game_over_screen(renderer, score, &playAgainButton, &exitButton, font);
                 break;
         }
         
-        // Update screen
+        // Display FPS in debug mode (optional)
+        if (0) { // Set to 1 to enable FPS display
+            char fps_text[16];
+            sprintf(fps_text, "FPS: %d", fps);
+            SDL_Color white = {255, 255, 255, 255};
+            draw_text(renderer, font, fps_text, 10, 10, white);
+        }
+        
+        // Present render
         SDL_RenderPresent(renderer);
+        
+        // Cap frame rate (optional)
+        SDL_Delay(1);
     }
     
-    // Clean up
+    // Cleanup resources
     TTF_CloseFont(font);
     SDL_DestroyRenderer(renderer);
     SDL_DestroyWindow(window);
